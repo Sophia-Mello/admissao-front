@@ -1,0 +1,537 @@
+'use client'
+import { useState } from 'react';
+import {
+  Table,
+  Button,
+  Modal,
+  Form,
+  Select,
+  Tag,
+  Space,
+  message,
+  Card,
+  Typography,
+  Alert,
+  Row,
+  Col,
+  Statistic,
+} from 'antd';
+import {
+  PlusOutlined,
+  SolutionOutlined,
+  EnvironmentOutlined,
+  TeamOutlined,
+  WarningOutlined,
+} from '@ant-design/icons';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import Layout from '../../components/Layout';
+import withRecrutamentoOrAdmin from '../../lib/withRecrutamentoOrAdmin';
+import api from '../../lib/api';
+
+const { Title, Text } = Typography;
+const { Option } = Select;
+
+/**
+ * Debug Panel Component (only shown in development)
+ */
+function DebugPanel() {
+  const [debugInfo, setDebugInfo] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const fetchDebugInfo = async () => {
+    setLoading(true);
+    try {
+      const res = await api.get('/admin/debug/regional-jobs/status');
+      setDebugInfo(res.data);
+    } catch (error) {
+      message.error('Erro ao carregar informações de debug');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (process.env.NODE_ENV === 'production') return null;
+
+  return (
+    <Card
+      title="🐛 Debug Panel (Development Only)"
+      style={{ marginBottom: '24px', backgroundColor: '#fffbe6', borderColor: '#ffe58f' }}
+      size="small"
+    >
+      <Space direction="vertical" style={{ width: '100%' }}>
+        <Button onClick={fetchDebugInfo} loading={loading} size="small">
+          Verificar Status do Sistema
+        </Button>
+
+        {debugInfo && (
+          <>
+            <Alert
+              message={debugInfo.ready_for_use ? 'Sistema Pronto' : 'Atenção: Problemas Detectados'}
+              type={debugInfo.ready_for_use ? 'success' : 'warning'}
+              description={
+                <div>
+                  <strong>Database:</strong>
+                  <ul>
+                    <li>Regionais: {debugInfo.status.database.regionais}</li>
+                    <li>Unidades: {debugInfo.status.database.unidades}</li>
+                    <li>Unidades com email: {debugInfo.status.database.unidades_com_email}</li>
+                    <li>Jobs criados: {debugInfo.status.database.jobs_criados}</li>
+                  </ul>
+
+                  <strong>Gupy API:</strong>
+                  <ul>
+                    <li>Configurada: {debugInfo.status.gupy.configured ? '✅ Sim' : '❌ Não'}</li>
+                    <li>Conectada: {debugInfo.status.gupy.connected ? '✅ Sim' : '❌ Não'}</li>
+                    {debugInfo.status.gupy.templates_count !== undefined && (
+                      <li>Templates: {debugInfo.status.gupy.templates_count}</li>
+                    )}
+                    {debugInfo.status.gupy.error && (
+                      <li style={{ color: 'red' }}>Erro: {debugInfo.status.gupy.error}</li>
+                    )}
+                  </ul>
+
+                  {debugInfo.status.warnings.length > 0 && (
+                    <>
+                      <strong>Avisos:</strong>
+                      <ul>
+                        {debugInfo.status.warnings.map((warning, idx) => (
+                          <li key={idx}>{warning}</li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                </div>
+              }
+            />
+          </>
+        )}
+      </Space>
+    </Card>
+  );
+}
+
+/**
+ * Página de gerenciamento de Jobs Regionais
+ * Permite criar vagas na Gupy e vincular unidades
+ */
+function RegionalJobsPage() {
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [selectedRegional, setSelectedRegional] = useState(null);
+  const [form] = Form.useForm();
+  const queryClient = useQueryClient();
+
+  // Query: Listar jobs regionais
+  const { data: jobsData, isLoading: loadingJobs, error: jobsError } = useQuery({
+    queryKey: ['regional-jobs'],
+    queryFn: async () => {
+      const res = await api.get('/admin/regional-jobs');
+      return res.data;
+    },
+    retry: 2,
+    staleTime: 60000, // 1 minute
+  });
+
+  // Query: Listar regionais
+  const { data: regionaisData, error: regionaisError } = useQuery({
+    queryKey: ['regionais'],
+    queryFn: async () => {
+      const res = await api.get('/admin/regional');
+      return res.data;
+    },
+    retry: 2,
+    staleTime: 300000, // 5 minutes (regionais rarely change)
+  });
+
+  // Query: Listar templates Gupy
+  const { data: templatesData, isLoading: loadingTemplates, error: templatesError } = useQuery({
+    queryKey: ['gupy-templates'],
+    queryFn: async () => {
+      const res = await api.get('/admin/gupy/templates');
+      return res.data;
+    },
+    retry: 1,
+    staleTime: 300000, // 5 minutes
+  });
+
+  // Query: Listar unidades de uma regional
+  const { data: unidadesData, isLoading: loadingUnidades, error: unidadesError } = useQuery({
+    queryKey: ['unidades', selectedRegional],
+    queryFn: async () => {
+      if (!selectedRegional) return { unidades: [] };
+      const res = await api.get(`/admin/regional/${selectedRegional}/unidades`);
+      return res.data;
+    },
+    enabled: !!selectedRegional,
+    retry: 2,
+  });
+
+  // Mutation: Criar job regional
+  const createJobMutation = useMutation({
+    mutationFn: async (values) => {
+      const res = await api.post('/admin/regional-jobs', values);
+      return res.data;
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries(['regional-jobs']);
+      setIsModalOpen(false);
+      form.resetFields();
+      setSelectedRegional(null);
+
+      // Exibir warnings se houver
+      if (data.warnings && data.warnings.length > 0) {
+        Modal.warning({
+          title: 'Job criado com avisos',
+          content: (
+            <div>
+              <p>Job criado com sucesso, mas algumas unidades têm problemas:</p>
+              <ul>
+                {data.warnings.map((w, idx) => (
+                  <li key={idx}>
+                    <strong>{w.nome_unidade}:</strong> {w.error}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ),
+          okText: 'Entendi',
+        });
+      } else {
+        message.success('Job criado com sucesso!');
+      }
+    },
+    onError: (error) => {
+      const errorMsg = error.response?.data?.error || 'Erro ao criar job';
+      const details = error.response?.data?.details;
+
+      Modal.error({
+        title: 'Erro ao criar job',
+        content: (
+          <div>
+            <p>{errorMsg}</p>
+            {details && <p style={{ fontSize: '12px', color: '#999' }}>{details}</p>}
+          </div>
+        ),
+      });
+    },
+  });
+
+  // Colunas da tabela de jobs
+  const columns = [
+    {
+      title: 'ID Gupy',
+      dataIndex: 'id_job_gupy',
+      key: 'id_job_gupy',
+      width: 150,
+      render: (text) => <Text code>{text}</Text>,
+    },
+    {
+      title: 'Nome do Job',
+      dataIndex: 'job_name',
+      key: 'job_name',
+      ellipsis: true,
+    },
+    {
+      title: 'Regional',
+      dataIndex: 'nome_regional',
+      key: 'nome_regional',
+      render: (text) => (
+        <Tag icon={<EnvironmentOutlined />} color="blue">
+          {text}
+        </Tag>
+      ),
+    },
+    {
+      title: 'Unidades',
+      dataIndex: 'total_unidades',
+      key: 'total_unidades',
+      align: 'center',
+      render: (count) => (
+        <Tag icon={<TeamOutlined />} color="green">
+          {count} {count === 1 ? 'unidade' : 'unidades'}
+        </Tag>
+      ),
+    },
+    {
+      title: 'Criado em',
+      dataIndex: 'created_at',
+      key: 'created_at',
+      render: (date) => new Date(date).toLocaleDateString('pt-BR'),
+    },
+  ];
+
+  // Handler: Abrir modal
+  const handleOpenModal = () => {
+    setIsModalOpen(true);
+  };
+
+  // Handler: Fechar modal
+  const handleCloseModal = () => {
+    setIsModalOpen(false);
+    form.resetFields();
+    setSelectedRegional(null);
+  };
+
+  // Handler: Mudança de regional no form
+  const handleRegionalChange = (value) => {
+    setSelectedRegional(value);
+    form.setFieldValue('unidade_ids', []); // Resetar unidades selecionadas
+  };
+
+  // Handler: Submit do formulário
+  const handleSubmit = async (values) => {
+    await createJobMutation.mutateAsync(values);
+  };
+
+  return (
+    <Layout>
+      <div style={{ padding: '24px' }}>
+        {/* Header */}
+        <Row justify="space-between" align="middle" style={{ marginBottom: '24px' }}>
+          <Col>
+            <Title level={2}>
+              <SolutionOutlined /> Jobs Regionais
+            </Title>
+            <Text type="secondary">
+              Gerencie vagas publicadas na Gupy e suas unidades vinculadas
+            </Text>
+          </Col>
+          <Col>
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              size="large"
+              onClick={handleOpenModal}
+            >
+              Criar Job
+            </Button>
+          </Col>
+        </Row>
+
+        {/* Debug Panel - Development Only */}
+        <DebugPanel />
+
+        {/* Estatísticas */}
+        {jobsData && (
+          <Row gutter={16} style={{ marginBottom: '24px' }}>
+            <Col span={8}>
+              <Card>
+                <Statistic
+                  title="Total de Jobs"
+                  value={jobsData.total || 0}
+                  prefix={<SolutionOutlined />}
+                />
+              </Card>
+            </Col>
+          </Row>
+        )}
+
+        {/* Tabela de Jobs */}
+        <Card>
+          <Table
+            columns={columns}
+            dataSource={jobsData?.jobs || []}
+            loading={loadingJobs}
+            rowKey="id_job_regional"
+            pagination={{
+              pageSize: 10,
+              showSizeChanger: true,
+              showTotal: (total) => `Total: ${total} jobs`,
+            }}
+          />
+        </Card>
+
+        {/* Modal: Criar Job */}
+        <Modal
+          title={
+            <Space>
+              <PlusOutlined />
+              <span>Criar Job Regional</span>
+            </Space>
+          }
+          open={isModalOpen}
+          onCancel={handleCloseModal}
+          footer={null}
+          width={700}
+          destroyOnHidden
+        >
+          <Alert
+            message="Este processo criará um job na Gupy e vinculará unidades"
+            type="info"
+            showIcon
+            style={{ marginBottom: '16px' }}
+          />
+
+          {templatesError && (
+            <Alert
+              message="Erro ao carregar templates Gupy"
+              description={
+                templatesError.response?.status === 503
+                  ? 'A integração com Gupy não está configurada. Verifique a variável GUPY_API_KEY.'
+                  : templatesError.response?.data?.details || templatesError.message
+              }
+              type="error"
+              showIcon
+              style={{ marginBottom: '16px' }}
+            />
+          )}
+
+          {regionaisError && (
+            <Alert
+              message="Erro ao carregar regionais"
+              description={regionaisError.response?.data?.details || regionaisError.message}
+              type="error"
+              showIcon
+              style={{ marginBottom: '16px' }}
+            />
+          )}
+
+          {unidadesError && selectedRegional && (
+            <Alert
+              message="Erro ao carregar unidades"
+              description={unidadesError.response?.data?.details || unidadesError.message}
+              type="error"
+              showIcon
+              style={{ marginBottom: '16px' }}
+            />
+          )}
+
+          <Form
+            form={form}
+            layout="vertical"
+            onFinish={handleSubmit}
+            disabled={createJobMutation.isPending}
+          >
+            {/* Template Gupy */}
+            <Form.Item
+              label="Template Gupy"
+              name="template_gupy_id"
+              rules={[{ required: true, message: 'Selecione um template' }]}
+              extra={
+                templatesData?.templates?.length === 0
+                  ? "⚠️ Nenhum template encontrado. Verifique a configuração da API Gupy."
+                  : "Selecione o template de vaga pré-configurado na Gupy"
+              }
+            >
+              <Select
+                placeholder={
+                  templatesData?.templates?.length === 0
+                    ? "Nenhum template disponível"
+                    : "Selecione o template"
+                }
+                loading={loadingTemplates}
+                disabled={templatesData?.templates?.length === 0}
+                showSearch
+                filterOption={(input, option) =>
+                  option.children.toLowerCase().includes(input.toLowerCase())
+                }
+                notFoundContent={
+                  loadingTemplates ? 'Carregando...' : 'Nenhum template encontrado'
+                }
+              >
+                {templatesData?.templates?.map((template) => (
+                  <Option key={template.id} value={template.id}>
+                    {template.name || template.title || template.id}
+                  </Option>
+                ))}
+              </Select>
+            </Form.Item>
+
+            {/* Regional */}
+            <Form.Item
+              label="Regional"
+              name="regional_id"
+              rules={[{ required: true, message: 'Selecione uma regional' }]}
+              extra={
+                regionaisData?.regionais?.length === 0
+                  ? "⚠️ Nenhuma regional cadastrada. Cadastre regionais primeiro."
+                  : "Selecione a regional responsável por esta vaga"
+              }
+            >
+              <Select
+                placeholder={
+                  regionaisData?.regionais?.length === 0
+                    ? "Nenhuma regional disponível"
+                    : "Selecione a regional"
+                }
+                onChange={handleRegionalChange}
+                disabled={regionaisData?.regionais?.length === 0}
+                showSearch
+                filterOption={(input, option) =>
+                  option.children.toLowerCase().includes(input.toLowerCase())
+                }
+                notFoundContent="Nenhuma regional encontrada"
+              >
+                {regionaisData?.regionais?.map((regional) => (
+                  <Option key={regional.id_regional} value={regional.id_regional}>
+                    {regional.nome_regional}
+                  </Option>
+                ))}
+              </Select>
+            </Form.Item>
+
+            {/* Unidades */}
+            <Form.Item
+              label="Unidades"
+              name="unidade_ids"
+              rules={[
+                { required: true, message: 'Selecione pelo menos uma unidade' },
+                {
+                  type: 'array',
+                  min: 1,
+                  message: 'Selecione pelo menos uma unidade',
+                },
+              ]}
+              extra="Selecione as unidades que receberão candidatos para esta vaga"
+            >
+              <Select
+                mode="multiple"
+                placeholder="Selecione as unidades"
+                loading={loadingUnidades}
+                disabled={!selectedRegional}
+                showSearch
+                filterOption={(input, option) =>
+                  option.children.toLowerCase().includes(input.toLowerCase())
+                }
+                optionLabelProp="label"
+              >
+                {unidadesData?.unidades?.map((unidade) => (
+                  <Option
+                    key={unidade.id_unidade}
+                    value={unidade.id_unidade}
+                    label={unidade.nome_unidade}
+                  >
+                    <Space>
+                      <span>{unidade.nome_unidade}</span>
+                      {!unidade.email_unidade && (
+                        <Tag icon={<WarningOutlined />} color="warning">
+                          Sem email
+                        </Tag>
+                      )}
+                    </Space>
+                  </Option>
+                ))}
+              </Select>
+            </Form.Item>
+
+            {/* Footer */}
+            <Form.Item style={{ marginBottom: 0, marginTop: '24px' }}>
+              <Space style={{ width: '100%', justifyContent: 'flex-end' }}>
+                <Button onClick={handleCloseModal}>Cancelar</Button>
+                <Button
+                  type="primary"
+                  htmlType="submit"
+                  loading={createJobMutation.isPending}
+                  icon={<PlusOutlined />}
+                >
+                  Criar Job
+                </Button>
+              </Space>
+            </Form.Item>
+          </Form>
+        </Modal>
+      </div>
+    </Layout>
+  );
+}
+
+export default withRecrutamentoOrAdmin(RegionalJobsPage);
